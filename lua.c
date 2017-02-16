@@ -50,9 +50,13 @@ static int uh_lua_recv(lua_State *L)
 	luaL_buffinit(L, &B);
 	while(len > 0) {
 		char *buf;
+		int max_read_len = LUAL_BUFFERSIZE;
+
+		if(len < max_read_len)
+			max_read_len = len;
 
 		buf = luaL_prepbuffer(&B);
-		r = read(STDIN_FILENO, buf, LUAL_BUFFERSIZE);
+		r = read(STDIN_FILENO, buf, max_read_len);
 		if (r < 0) {
 			if (errno == EWOULDBLOCK || errno == EAGAIN) {
 				pfd.revents = 0;
@@ -72,6 +76,7 @@ static int uh_lua_recv(lua_State *L)
 
 		luaL_addsize(&B, r);
 		data_len += r;
+		len -= r;
 		if (r != LUAL_BUFFERSIZE)
 			break;
 	}
