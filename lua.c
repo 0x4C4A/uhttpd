@@ -17,12 +17,15 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#define _GNU_SOURCE
 #include <libubox/blobmsg.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
 #include <stdio.h>
 #include <poll.h>
+#include <string.h>
+#include <ctype.h>
 
 #include "uhttpd.h"
 #include "plugin.h"
@@ -103,6 +106,411 @@ static int uh_lua_send(lua_State *L)
 	return 1;
 }
 
+static int uh_lua_recv_to_file(lua_State *L)
+{
+	static struct pollfd pfd = {
+		.fd = STDIN_FILENO,
+		.events = POLLIN,
+	};
+	static char buf[4096];
+	ssize_t total = 0, max_size = -1, remaining;
+	int fd, r, read_size;
+	FILE *file;
+
+	/* First parameter should be a Lua file handle from io.open() */
+	if (!lua_isuserdata(L, 1)) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Expected file handle from io.open()");
+		return 2;
+	}
+
+	/* Get the FILE* from the Lua file handle */
+	file = *(FILE**)luaL_checkudata(L, 1, LUA_FILEHANDLE);
+	if (!file) {
+		lua_pushnil(L);
+		lua_pushstring(L, "File handle is closed or invalid");
+		return 2;
+	}
+
+	/* Get the underlying file descriptor */
+	fd = fileno(file);
+	if (fd < 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Cannot get file descriptor from file handle");
+		return 2;
+	}
+
+	/* Optional second parameter: maximum size to read from request */
+	if (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) {
+		max_size = luaL_checkinteger(L, 2);
+		if (max_size < 0) {
+			lua_pushnil(L);
+			lua_pushstring(L, "Invalid maximum size");
+			return 2;
+		}
+	}
+
+	remaining = max_size;
+	while (1) {
+		/* Determine how much to read this iteration */
+		if (max_size >= 0) {
+			if (remaining <= 0)
+				break;
+			read_size = (remaining < (ssize_t)sizeof(buf)) ? remaining : (int)sizeof(buf);
+		} else {
+			read_size = sizeof(buf);
+		}
+
+		r = read(STDIN_FILENO, buf, read_size);
+		if (r < 0) {
+			if (errno == EWOULDBLOCK || errno == EAGAIN) {
+				if(max_size >= 0)
+					/* No data available right now - return what we have so far */
+					break;
+
+				pfd.revents = 0;
+				poll(&pfd, 1, 1000);
+				if (pfd.revents & POLLIN)
+					continue;
+			}
+			if (errno == EINTR)
+				continue;
+			lua_pushnil(L);
+			lua_pushstring(L, strerror(errno));
+			return 2;
+		}
+
+		if (!r)
+			break;
+
+		if (write(fd, buf, r) != r) {
+			lua_pushnil(L);
+			lua_pushstring(L, "write error");
+			return 2;
+		}
+
+		total += r;
+		if (max_size >= 0)
+			remaining -= r;
+
+		/* For non-blocking behavior, break after reading any amount of data */
+		if (total > 0)
+			break;
+	}
+
+	lua_pushnumber(L, total);
+	return 1;
+}
+
+/* Multipart parser state */
+enum multipart_state {
+	MP_BOUNDARY_SEARCH,
+	MP_HEADERS,
+	MP_FILE_DATA,
+	MP_END
+};
+
+static int multipart_error(lua_State *L, FILE *file, int headers_ref,
+			   const char *location, const char *msg)
+{
+	if (file) {
+		fclose(file);
+		if (location)
+			remove(location);
+	}
+
+	if (headers_ref != LUA_NOREF)
+		luaL_unref(L, LUA_REGISTRYINDEX, headers_ref);
+
+	lua_pushnil(L);
+	lua_pushstring(L, msg);
+	return 2;
+}
+
+/* Helper: Parse multipart headers and push Lua table on stack */
+static int parse_multipart_headers(lua_State *L, const char *header_data, size_t header_len)
+{
+	char *header_copy = malloc(header_len + 1);
+	if (!header_copy)
+		return -1;
+
+	memcpy(header_copy, header_data, header_len);
+	header_copy[header_len] = '\0';
+
+	lua_newtable(L);
+
+	/* Parse each header line */
+	char *line_start = header_copy;
+	char *line_end;
+
+	while ((line_end = strstr(line_start, "\r\n")) != NULL) {
+		*line_end = '\0';
+
+		/* Find the colon separator */
+		char *colon = strchr(line_start, ':');
+		if (colon) {
+			*colon = '\0';
+			char *header_name = line_start;
+			char *header_value = colon + 1;
+
+			/* Convert header name to lowercase to simplify parsing lua-side */
+			for (char *p = header_name; p < colon; p++)
+				*p = tolower((unsigned char)*p);
+
+			/* Skip leading whitespace in value */
+			while (*header_value == ' ' || *header_value == '\t')
+				header_value++;
+
+			/* Add to Lua table */
+			lua_pushstring(L, header_value);
+			lua_setfield(L, -2, header_name);
+		}
+
+		/* Move to next line */
+		line_start = line_end + 1;
+		if (*line_start == '\n')
+			line_start++;
+	}
+
+	free(header_copy);
+	return 0;
+}
+
+static int uh_lua_recv_multipart_to_file(lua_State *L)
+{
+	struct pollfd pfd = {
+		.fd = STDIN_FILENO,
+		.events = POLLIN,
+	};
+	char buf[8192];
+	char boundary[256];
+	char full_boundary[260];  /* "--" + boundary */
+	char next_boundary[264];  /* "\r\n--" + boundary */
+
+	ssize_t total_written = 0, max_size, remaining;
+	int fd, read_size, boundary_len, full_boundary_len, next_boundary_len;
+	FILE *file = NULL;
+	const char *location, *boundary_param;
+	size_t location_len, boundary_param_len;
+
+	enum multipart_state state = MP_BOUNDARY_SEARCH;
+	char *data_start = buf;
+	int buf_pos = 0;
+	int headers_ref = LUA_NOREF;
+
+	/* Validate and extract parameters */
+	location = luaL_checklstring(L, 1, &location_len);
+	max_size = luaL_checkinteger(L, 2);
+	if (max_size < 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Invalid maximum size");
+		return 2;
+	}
+
+	boundary_param = luaL_checklstring(L, 3, &boundary_param_len);
+	if (boundary_param_len == 0 || boundary_param_len >= sizeof(boundary)) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Boundary too long");
+		return 2;
+	}
+
+	/* Prepare boundary strings */
+	memcpy(boundary, boundary_param, boundary_param_len);
+	boundary[boundary_param_len] = '\0';
+	boundary_len = boundary_param_len;
+	snprintf(full_boundary, sizeof(full_boundary), "--%s", boundary);
+	full_boundary_len = boundary_len + 2;
+	snprintf(next_boundary, sizeof(next_boundary), "\r\n--%s", boundary);
+	next_boundary_len = boundary_len + 4;
+
+	/* Open file for writing */
+	file = fopen(location, "wb");
+	if (!file) {
+		lua_pushnil(L);
+		lua_pushstring(L, "Cannot open file for writing");
+		return 2;
+	}
+
+	fd = fileno(file);
+	if (fd < 0)
+		return multipart_error(L, file, headers_ref, location,
+				       "Cannot get file descriptor");
+
+	remaining = max_size;
+
+	/* Main processing loop */
+	while (state != MP_END) {
+		/* Read more data if buffer is not full */
+		if (buf_pos < (int)sizeof(buf)) {
+			/* Determine how much to read */
+			if (max_size >= 0 && remaining <= 0)
+				return multipart_error(L, file, headers_ref,
+						       location,
+						       "Maximum size exceeded");
+
+			read_size = (int)sizeof(buf) - buf_pos;
+			if (max_size >= 0 && remaining < (ssize_t)read_size)
+				read_size = (int)remaining;
+
+			ssize_t r;
+			while (1) {
+				r = read(STDIN_FILENO, buf + buf_pos, read_size);
+
+				if (r > 0)
+					break; // Successful read
+
+				if (r == 0)
+					return multipart_error(L, file, headers_ref,
+								location, "Unexpected end of input");
+
+				if (errno == EINTR)
+					continue; // Retry read
+
+				if ((errno == EWOULDBLOCK || errno == EAGAIN) && max_size < 0) {
+					pfd.revents = 0;
+					poll(&pfd, 1, 1000);
+					if (pfd.revents & POLLIN)
+						continue; // Retry read after waiting
+				}
+
+				return multipart_error(L, file, headers_ref,
+						       location, strerror(errno));
+			}
+
+			buf_pos += r;
+			if (max_size >= 0)
+				remaining -= r;
+		}
+
+		char *search_start = data_start;
+		int search_len = buf_pos - (data_start - buf);
+
+		/* Process buffer content based on current state */
+		switch (state) {
+		case MP_BOUNDARY_SEARCH: {
+			char *boundary_pos = memmem(search_start, search_len, full_boundary, full_boundary_len);
+			if (!boundary_pos) {
+				/* Keep enough data to handle split boundary */
+				int keep_len = full_boundary_len - 1;
+				if (keep_len < 0)
+					return multipart_error(L, file, headers_ref,
+							       location, "Invalid boundary");
+				if (search_len > keep_len) {
+					if (keep_len > 0)
+						memmove(buf, buf + buf_pos - keep_len, keep_len);
+					buf_pos = keep_len;
+					data_start = buf;
+				}
+				break;
+			}
+
+			data_start = boundary_pos + full_boundary_len;
+			/* Skip CRLF after boundary */
+			if (data_start + 1 < buf + buf_pos && data_start[0] == '\r' && data_start[1] == '\n')
+				data_start += 2;
+
+			state = MP_HEADERS;
+			break;
+		}
+
+		case MP_HEADERS: {
+			const size_t header_limit = 4096;
+			char *header_end = memmem(search_start, search_len, "\r\n\r\n", 4);
+			if (!header_end) {
+				if (search_len >= (int)sizeof(buf) ||
+				    search_len > (int)header_limit)
+					return multipart_error(L, file, headers_ref,
+							       location,
+							       "Multipart headers too large");
+
+				if (data_start != buf) {
+					memmove(buf, data_start, search_len);
+					data_start = buf;
+					buf_pos = search_len;
+				}
+
+				break;
+			}
+
+			/* Parse headers if not already done */
+			if (headers_ref == LUA_NOREF) {
+				size_t header_len = (header_end + 2) - search_start; // +2 to include the final CRLF
+				if (parse_multipart_headers(L, search_start, header_len) < 0)
+					return multipart_error(L, file, headers_ref,
+							       location,
+							       "Out of memory");
+				headers_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+			}
+
+			data_start = header_end + 4;
+			state = MP_FILE_DATA;
+			break;
+		}
+
+		case MP_FILE_DATA: {
+			char *boundary_pos = memmem(search_start, search_len, next_boundary, next_boundary_len);
+			int write_len;
+			int is_final_write = 0;
+
+			if (boundary_pos) {
+				/* Write file data up to boundary */
+				write_len = boundary_pos - search_start;
+				is_final_write = 1;
+			} else {
+				/* Write safe portion, keeping enough for boundary detection */
+				write_len = search_len - next_boundary_len;
+			}
+
+			if (write_len > 0) {
+				/* Write all data, handling partial writes and EINTR */
+				ssize_t written = 0;
+				while (written < (ssize_t)write_len) {
+					ssize_t n = write(fd, search_start + written, write_len - written);
+					if (n < 0) {
+						if (errno == EINTR)
+							continue;
+						return multipart_error(L, file, headers_ref,
+								       location, "write error");
+					}
+					written += n;
+				}
+				total_written += write_len;
+			}
+
+			if (is_final_write) {
+				state = MP_END;
+			} else if (write_len > 0) {
+				/* Move remaining data to start of buffer */
+				int remaining_buf = search_len - write_len;
+				memmove(buf, search_start + write_len, remaining_buf);
+				buf_pos = remaining_buf;
+				data_start = buf;
+			}
+			break;
+		}
+
+		case MP_END:
+			break;
+		}
+	}
+
+	fclose(file);
+
+	if (headers_ref == LUA_NOREF) {
+		remove(location);
+		lua_pushnil(L);
+		lua_pushstring(L, "Missing multipart headers");
+		return 2;
+	}
+
+	/* Return byte count and headers table */
+	lua_pushnumber(L, total_written);
+	lua_rawgeti(L, LUA_REGISTRYINDEX, headers_ref);
+	luaL_unref(L, LUA_REGISTRYINDEX, headers_ref);
+
+	return 2;
+}
+
 static int
 uh_lua_strconvert(lua_State *L, int (*convert)(char *, int, const char *, int))
 {
@@ -160,6 +568,12 @@ static lua_State *uh_lua_state_init(struct lua_prefix *lua)
 
 	lua_pushcfunction(L, uh_lua_recv);
 	lua_setfield(L, -2, "recv");
+
+	lua_pushcfunction(L, uh_lua_recv_to_file);
+	lua_setfield(L, -2, "recv_to_file");
+
+	lua_pushcfunction(L, uh_lua_recv_multipart_to_file);
+	lua_setfield(L, -2, "recv_multipart_to_file");
 
 	lua_pushcfunction(L, uh_lua_urldecode);
 	lua_setfield(L, -2, "urldecode");
