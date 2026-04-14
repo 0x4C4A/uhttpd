@@ -24,6 +24,7 @@
 #define _BSD_SOURCE
 #define _DARWIN_C_SOURCE
 #define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 
 #include <sys/types.h>
 #include <sys/dir.h>
@@ -64,6 +65,7 @@ enum file_hdr {
 	HDR_IF_MATCH,
 	HDR_IF_NONE_MATCH,
 	HDR_IF_RANGE,
+	HDR_ACCEPT_ENCODING,
 	__HDR_MAX
 };
 
@@ -591,7 +593,36 @@ static void uh_file_free(struct client *cl)
 	close(cl->dispatch.file.fd);
 }
 
-static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
+static bool uh_file_gzip_variant(struct path_info *pi, struct blob_attr **tb)
+{
+	static char gz_phys[PATH_MAX];
+	struct blob_attr *ae = tb[HDR_ACCEPT_ENCODING];
+	struct stat st;
+	size_t nlen, plen;
+
+	if (!ae || !memmem(blobmsg_data(ae), blobmsg_data_len(ae), "gzip", 4))
+		return false;
+
+	nlen = strlen(pi->name);
+	if (nlen < 3 || memcmp(pi->name + nlen - 3, ".js", 3))
+		return false;
+
+	plen = strlen(pi->phys);
+	if (plen + 4 > sizeof(gz_phys))
+		return false;
+	memcpy(gz_phys, pi->phys, plen);
+	memcpy(gz_phys + plen, ".gz", 4);
+
+	if (stat(gz_phys, &st) || !S_ISREG(st.st_mode) || !(st.st_mode & S_IROTH))
+		return false;
+
+	pi->phys = gz_phys;
+	pi->stat = st;
+	return true;
+}
+
+static void uh_file_data(struct client *cl, struct path_info *pi, int fd,
+			 bool gzip)
 {
 	/* test preconditions */
 	if (!cl->dispatch.no_cache &&
@@ -611,6 +642,9 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd)
 
 	ustream_printf(cl->us, "Content-Type: %s\r\n",
 			   uh_file_mime_lookup(pi->name));
+
+	if (gzip)
+		ustream_printf(cl->us, "Content-Encoding: gzip\r\n");
 
 	ustream_printf(cl->us, "Content-Length: %" PRIu64 "\r\n\r\n",
 			   pi->stat.st_size);
@@ -657,13 +691,15 @@ static void uh_file_request(struct client *cl, const char *url,
 		goto error;
 
 	if (pi->stat.st_mode & S_IFREG) {
+		bool gzip = uh_file_gzip_variant(pi, tb);
+
 		fd = open(pi->phys, O_RDONLY);
 		if (fd < 0)
 			goto error;
 
 		req->disable_chunked = true;
 		cl->dispatch.file.hdr = tb;
-		uh_file_data(cl, pi, fd);
+		uh_file_data(cl, pi, fd, gzip);
 		cl->dispatch.file.hdr = NULL;
 		return;
 	}
@@ -839,6 +875,7 @@ static bool __handle_file_request(struct client *cl, char *url)
 		[HDR_IF_MATCH] = { "if-match", BLOBMSG_TYPE_STRING },
 		[HDR_IF_NONE_MATCH] = { "if-none-match", BLOBMSG_TYPE_STRING },
 		[HDR_IF_RANGE] = { "if-range", BLOBMSG_TYPE_STRING },
+		[HDR_ACCEPT_ENCODING] = { "accept-encoding", BLOBMSG_TYPE_STRING },
 	};
 	struct dispatch_handler *d;
 	struct blob_attr *tb[__HDR_MAX];
