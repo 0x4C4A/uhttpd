@@ -24,7 +24,6 @@
 #define _BSD_SOURCE
 #define _DARWIN_C_SOURCE
 #define _XOPEN_SOURCE 700
-#define _GNU_SOURCE
 
 #include <sys/types.h>
 #include <sys/dir.h>
@@ -277,6 +276,45 @@ uh_path_lookup(struct client *cl, const char *url)
 	p.name = &path_phys[docroot_len];
 
 	return p.phys ? &p : NULL;
+}
+
+static struct path_info *
+uh_path_lookup_gzip(struct client *cl, const char *url)
+{
+	static char gz_url[PATH_MAX];
+	static char gz_name[PATH_MAX];
+	struct path_info *pi;
+	const char *query;
+	size_t path_len, query_len, name_len;
+
+	query = strchr(url, '?');
+	path_len = query ? (size_t)(query - url) : strlen(url);
+	query_len = query ? strlen(query) : 0;
+
+	if (path_len + 4 + query_len > sizeof(gz_url))
+		return NULL;
+
+	memcpy(gz_url, url, path_len);
+	memcpy(gz_url + path_len, ".gz", 3);
+	if (query)
+		memcpy(gz_url + path_len + 3, query, query_len + 1);
+	else
+		gz_url[path_len + 3] = 0;
+
+	pi = uh_path_lookup(cl, gz_url);
+	if (!pi || pi->redirected || pi->info || !S_ISREG(pi->stat.st_mode))
+		return NULL;
+
+	name_len = strlen(pi->name);
+	if (name_len < 3 || strcmp(pi->name + name_len - 3, ".gz"))
+		return NULL;
+
+	memcpy(gz_name, pi->name, name_len - 3);
+	gz_name[name_len - 3] = 0;
+
+	pi->name = gz_name;
+	pi->gzip = true;
+	return pi;
 }
 
 static const char * uh_file_mime_lookup(const char *path)
@@ -593,36 +631,87 @@ static void uh_file_free(struct client *cl)
 	close(cl->dispatch.file.fd);
 }
 
-static bool uh_file_gzip_variant(struct path_info *pi, struct blob_attr **tb)
+static bool uh_accept_encoding_gzip(struct blob_attr *ae)
 {
-	static char gz_phys[PATH_MAX];
-	struct blob_attr *ae = tb[HDR_ACCEPT_ENCODING];
-	struct stat st;
-	size_t nlen, plen;
+	const char *s, *p;
 
-	if (!ae || !memmem(blobmsg_data(ae), blobmsg_data_len(ae), "gzip", 4))
+	if (!ae)
 		return false;
 
-	nlen = strlen(pi->name);
-	if (nlen < 3 || memcmp(pi->name + nlen - 3, ".js", 3))
-		return false;
+	s = blobmsg_get_string(ae);
+	for (p = s; *p; p++) {
+		const char *end, *q;
+
+		if (strncasecmp(p, "gzip", 4))
+			continue;
+		if ((p > s && p[-1] != ',' && p[-1] != ' ' && p[-1] != '\t') ||
+		    (p[4] && p[4] != ',' && p[4] != ';' && p[4] != ' ' && p[4] != '\t'))
+			continue;
+
+		end = strchr(p, ',');
+		if (!end)
+			end = p + strlen(p);
+
+		for (q = p + 4; q + 2 < end; q++)
+			if ((*q == 'q' || *q == 'Q') && q[1] == '=' &&
+			    strtod(q + 2, NULL) == 0.0)
+				return false;
+		return true;
+	}
+	return false;
+}
+
+static bool
+uh_file_get_gzip_path(struct path_info *pi, char *gz_phys, size_t len, struct stat *st)
+{
+	size_t plen;
 
 	plen = strlen(pi->phys);
-	if (plen + 4 > sizeof(gz_phys))
+	if (plen + 4 > len)
 		return false;
+
 	memcpy(gz_phys, pi->phys, plen);
 	memcpy(gz_phys + plen, ".gz", 4);
 
-	if (stat(gz_phys, &st) || !S_ISREG(st.st_mode) || !(st.st_mode & S_IROTH))
+	if (stat(gz_phys, st) || !S_ISREG(st->st_mode) || !(st->st_mode & S_IROTH))
+		return false;
+
+	return true;
+}
+
+static bool uh_file_has_gzip_variant(struct path_info *pi)
+{
+	char gz_phys[PATH_MAX];
+	struct stat st;
+
+	if (pi->gzip)
+		return true;
+
+	return uh_file_get_gzip_path(pi, gz_phys, sizeof(gz_phys), &st);
+}
+
+static bool uh_file_gzip_variant(struct path_info *pi, struct blob_attr **tb)
+{
+	static char gz_phys[PATH_MAX];
+	struct stat st;
+
+	if (pi->gzip)
+		return true;
+
+	if (!uh_accept_encoding_gzip(tb[HDR_ACCEPT_ENCODING]))
+		return false;
+
+	if (!uh_file_get_gzip_path(pi, gz_phys, sizeof(gz_phys), &st))
 		return false;
 
 	pi->phys = gz_phys;
 	pi->stat = st;
+	pi->gzip = true;
 	return true;
 }
 
 static void uh_file_data(struct client *cl, struct path_info *pi, int fd,
-			 bool gzip)
+			 bool gzip, bool vary)
 {
 	/* test preconditions */
 	if (!cl->dispatch.no_cache &&
@@ -631,6 +720,14 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd,
 	     !uh_file_if_range(cl, &pi->stat) ||
 	     !uh_file_if_unmodified_since(cl, &pi->stat) ||
 	     !uh_file_if_none_match(cl, &pi->stat))) {
+		if (cl->http_code == 304) {
+			if (vary)
+				ustream_printf(cl->us, "Vary: Accept-Encoding\r\n");
+
+			if (gzip)
+				ustream_printf(cl->us, "Content-Encoding: gzip\r\n");
+		}
+
 		ustream_printf(cl->us, "\r\n");
 		uh_request_done(cl);
 		close(fd);
@@ -642,6 +739,9 @@ static void uh_file_data(struct client *cl, struct path_info *pi, int fd,
 
 	ustream_printf(cl->us, "Content-Type: %s\r\n",
 			   uh_file_mime_lookup(pi->name));
+
+	if (vary)
+		ustream_printf(cl->us, "Vary: Accept-Encoding\r\n");
 
 	if (gzip)
 		ustream_printf(cl->us, "Content-Encoding: gzip\r\n");
@@ -691,6 +791,7 @@ static void uh_file_request(struct client *cl, const char *url,
 		goto error;
 
 	if (pi->stat.st_mode & S_IFREG) {
+		bool vary = uh_file_has_gzip_variant(pi);
 		bool gzip = uh_file_gzip_variant(pi, tb);
 
 		fd = open(pi->phys, O_RDONLY);
@@ -699,7 +800,7 @@ static void uh_file_request(struct client *cl, const char *url,
 
 		req->disable_chunked = true;
 		cl->dispatch.file.hdr = tb;
-		uh_file_data(cl, pi, fd, gzip);
+		uh_file_data(cl, pi, fd, gzip, vary);
 		cl->dispatch.file.hdr = NULL;
 		return;
 	}
@@ -882,14 +983,17 @@ static bool __handle_file_request(struct client *cl, char *url)
 	struct path_info *pi;
 	char *user, *pass, *auth;
 
+	blobmsg_parse(hdr_policy, __HDR_MAX, tb, blob_data(cl->hdr.head), blob_len(cl->hdr.head));
+
 	pi = uh_path_lookup(cl, url);
+	if (!pi && uh_accept_encoding_gzip(tb[HDR_ACCEPT_ENCODING]))
+		pi = uh_path_lookup_gzip(cl, url);
+
 	if (!pi)
 		return false;
 
 	if (pi->redirected)
 		return true;
-
-	blobmsg_parse(hdr_policy, __HDR_MAX, tb, blob_data(cl->hdr.head), blob_len(cl->hdr.head));
 
 	auth = tb[HDR_AUTHORIZATION] ? blobmsg_data(tb[HDR_AUTHORIZATION]) : NULL;
 

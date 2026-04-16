@@ -155,6 +155,7 @@ struct path_info {
 	const char *name;
 	const char *info;
 	const char *query;
+	bool gzip;
 	bool redirected;
 	struct stat stat;
 	const struct interpreter *ip;
